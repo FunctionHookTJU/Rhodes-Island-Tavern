@@ -1,35 +1,87 @@
-﻿# Python cache/build artifacts
+# ============================================================
+#  酒馆自走棋 · .gitignore
+#
+#  部署要点：服务器上的玩家存档属于「运行时数据」，绝不能被 git 覆盖。
+#  存档位置为 data/autochess.sqlite（server.py 的 DB_PATH）。
+#  git pull 不会删除未跟踪文件，因此只要存档不被跟踪，
+#  它就会一直留在服务器上；首次启动时 server.py 会用 schema.sql 自动建库。
+#  切勿用 `git add -f` 强行提交 data/ 下的任何文件。
+# ============================================================
+
+# ---------- 运行时数据 / 玩家存档（严禁提交）----------
+data/
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.db3
+saves/
+*.save
+*.save.*
+*.bak
+*.backup
+
+# ---------- Python 缓存与构建产物 ----------
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
+build/
+dist/
+*.egg-info/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+htmlcov/
 
-# Local game database / player saves
-data/*.sqlite
-data/*.sqlite-*
-data/*.db
-data/*.db-*
+# ---------- 本地开发笔记与维护脚本 ----------
+# 皮肤源文件、注入脚本、CDP 回归脚本等只在本机使用，不参与部署。
+.workbuddy/
 
-# Virtual environments
+# ---------- 卡面立绘素材（纳入追踪）----------
+# 56 张精二 / 普通立绘 webp（约 6.9 MB）+ _manifest.json 素材清单一起入库，
+# 这样服务器部署后卡面立绘立即可用，不需要额外拷图。
+# 注意：素材版权归 Hypergryph / 鹰角网络所有，仅供本学习项目使用，请勿商用。
+#
+# 唯一排除项：由 tools/build_e2_gallery.py 生成的图集页，
+# 它引用了并不存在的 _thumbs/ 缩略图，且不是游戏运行所需。
+/assets/精二立绘/index.html
+
+# ---------- 日志与临时文件 ----------
+*.log
+logs/
+*.tmp
+.cache/
+*.pid
+*.swp
+*~
+
+# ---------- 虚拟环境 ----------
 .venv/
 venv/
 env/
 ENV/
 
-# Logs and local runtime files
-*.log
-*.tmp
-*.bak
+# ---------- 密钥 / 本地环境变量 ----------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
 
-# OS / editor files
+# ---------- 编辑器 / 操作系统 ----------
+.vscode/
+.idea/
+*.code-workspace
 .DS_Store
 Thumbs.db
 desktop.ini
-.vscode/
-.idea/
 
-# Local env/secrets
-.env
-.env.*
+# ---------- Node（如后续引入前端构建）----------
+node_modules/
+.pnpm-store/
+npm-debug.log*
+yarn-error.log*
