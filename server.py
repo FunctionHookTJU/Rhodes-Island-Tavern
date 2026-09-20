@@ -1066,11 +1066,19 @@ def enemy_board(round_number, shop_level=1):
 
 class Handler(SimpleHTTPRequestHandler):
     extensions_map={**SimpleHTTPRequestHandler.extensions_map,".html":"text/html; charset=utf-8",".css":"text/css; charset=utf-8",".js":"application/javascript; charset=utf-8"}
+    # 立绘等静态图片体积大且不常变：允许本地缓存，只做 304 条件校验，
+    # 避免每次重新插入 <img> 都重新下载导致卡面闪烁；HTML/API 仍然不缓存。
+    CACHEABLE_STATIC=(".webp",".png",".jpg",".jpeg",".gif",".svg",".ico",".woff",".woff2",".ttf")
     def __init__(self,*a,**kw): super().__init__(*a,directory=str(ROOT),**kw)
     def end_headers(self):
-        self.send_header("Cache-Control","no-store, no-cache, must-revalidate, max-age=0")
-        self.send_header("Pragma","no-cache")
-        self.send_header("Expires","0")
+        path=urlparse(self.path).path.lower()
+        if path.endswith(self.CACHEABLE_STATIC):
+            self.send_header("Cache-Control","public, max-age=0, must-revalidate")
+            self.send_header("Vary","Accept-Encoding")
+        else:
+            self.send_header("Cache-Control","no-store, no-cache, must-revalidate, max-age=0")
+            self.send_header("Pragma","no-cache")
+            self.send_header("Expires","0")
         super().end_headers()
     def json(self,payload,status=200):
         raw=json.dumps(payload,ensure_ascii=False).encode(); self.send_response(status); self.send_header("Content-Type","application/json; charset=utf-8"); self.send_header("Content-Length",str(len(raw))); self.end_headers(); self.wfile.write(raw)

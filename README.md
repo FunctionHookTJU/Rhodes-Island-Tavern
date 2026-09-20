@@ -30,3 +30,29 @@
 - 修改棋子时编辑 `schema.sql` 并重启服务即可，不再需要修改 `server.py` 中的棋子常量。
 
 核心服务逻辑位于 `server.py`：`buy_card()`、`first_striker()`、`tavern_battle()` 和 `enemy_board()`。数据库结构见 `schema.sql`。
+
+## 部署：保护服务器存档
+
+`data/autochess.sqlite` 是**运行时数据**，里面存着服务器上所有玩家的金币、生命、回合与商店等级。它已在 `.gitignore` 中整目录忽略（`data/`），且从未被 git 跟踪，因此：
+
+- `git pull` 只更新被跟踪的源码文件，**不会删除也不会覆盖**服务器上的存档；
+- 首次部署时 `server.py` 会自动 `mkdir data/` 并用 `schema.sql` 建库，所以仓库里不需要预置空存档；
+- 请**不要**用 `git add -f` 强行提交 `data/` 下的任何文件，那会让本地存档在服务器上覆盖线上存档。
+
+备份线上存档时直接复制该文件即可（SQLite 单文件）：
+
+```bash
+cp data/autochess.sqlite data/autochess.sqlite.bak.$(date +%F)
+```
+
+`.gitignore` 同时忽略了 `*.sqlite` / `*.db` / `*.sqlite-*` / `*.db-*` / `saves/` 等模式，
+所以即使把存档或备份放到 `data/` 以外的位置，也仍然不会被误提交。
+部署前可用 `git add -A --dry-run` 确认待暂存清单里没有存档。
+
+## 界面与立绘
+
+- 前端整体采用明日方舟 / PRTS 终端风格：碳黑底（`#141516`）、深灰面板、45° 斜切角、1px 细线、四角准星、极淡网格与扫描线；强调色只用酸橙绿 `#B7E000`、暖黄 `#F5D800`、行动锈橙 `#C14701`；数值与英文标签统一等宽字体、中文标题用粗宋。
+- 每张棋子卡的卡面即该干员的立绘，取自 `assets/精二立绘/`（`_manifest.json` 为素材清单）。立绘映射表是 `index.html` 中的 `const ART={...}`，键为 `unit_cards.id`，共 56 条。
+- 卡面结构：立绘 + 左上阵营标签 + 右上六边形星级标 + 等宽 `ATK / HP` 数据条 + 中文名牌与生命条；金卡为暖金描边，技能卡不配立绘，走几何切分版式。
+- 稀有度统一按星级取色：I 灰、II 蓝、III 紫、IV 金、V 橙、VI 红，同时用于卡框、左侧色条与准星。
+- 皮肤源文件与注入/检查脚本存放在 `.workbuddy/tmp/`，改皮肤的流程见 `.workbuddy/tmp/README.md`。
