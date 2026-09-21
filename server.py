@@ -1,6 +1,6 @@
 """???????SQLite ???????? API????python server.py"""
 from __future__ import annotations
-import copy, json, math, random, re, socket, sqlite3
+import copy, json, logging, math, random, re, socket, sqlite3
 from contextlib import contextmanager
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -341,9 +341,14 @@ def trigger_death_feud(dead_unit, dead_index, side, allies, foes, events):
             if eff.get("type")=="random_bullet_damage":
                 target_count=max(1,int(eff.get("target_count",1) or 1))
                 living=[(i,t) for i,t in enumerate(foes) if t and t.get("current_hp",0)>0]
+                batch_start=len(events)
+                events.append({"type":"bullet_batch_start"})
+                pending=[]
                 for ti,target in random.sample(living,min(target_count,len(living))) if living else []:
                     if u.get("current_hp",0)<=0: break
-                    deal_bullet_damage(u,idx,side,allies,foes,ti,target,eff.get("damage",0),events,source_effect="death_feud")
+                    deal_bullet_damage(u,idx,side,allies,foes,ti,target,eff.get("damage",0),events,source_effect="death_feud",pending_deaths=pending,record_cumulative=False)
+                finish_bullet_batch(side,allies,events,batch_start)
+                resolve_pending_deaths(pending,events)
                 gain=int(eff.get("self_bullet_strength",0) or 0)
                 if gain:
                     u["bullet_strength_temp"]=int(u.get("bullet_strength_temp",0) or 0)+gain
@@ -390,24 +395,28 @@ def cumulative_damage_effect(unit):
     if eff: return eff
     return {"threshold":3,"attack":1,"max_hp":1,"counter_key":"cumulative_damage_count"} if unit.get("id")=="Enforcer" else None
 
-def record_damage_instance(side, team, events):
+def record_damage_instances(side, team, events, amount=1):
+    amount=max(0,int(amount or 0))
+    if not amount: return
     for idx,u in enumerate(team):
-        # Units that are still present but have just been reduced to 0 HP by the
-        # same damage exchange may still receive/trigger cumulative permanent
-        # buffs before death is finalized. Already-dead units are removed as None.
+        # 同一效果内的多次伤害可以批量计数；伤害动画全部完成后，再逐次结算增益。
         if not u: continue
         eff=cumulative_damage_effect(u)
         if not eff: continue
         key=eff.get("counter_key","cumulative_damage_count"); threshold=max(1,int(eff.get("threshold",3) or 3))
-        count=int(u.get(key,0) or 0)+1; triggers=count//threshold; count=count%threshold; u[key]=count
-        events.append({"type":"cumulative_counter","side":side,"slot":idx+1,"from":u["name"],"mechanic":"cumulative","count":count,"threshold":threshold,"counter_key":key})
-        if triggers:
-            atk_gain=int(eff.get("attack",1) or 0)*triggers; hp_gain=int(eff.get("max_hp",1) or 0)*triggers; bs_gain=int(eff.get("bullet_strength",0) or 0)*triggers
+        total=int(u.get(key,0) or 0)+amount; triggers=total//threshold; count=total%threshold; u[key]=count
+        events.append({"type":"cumulative_counter","side":side,"slot":idx+1,"from":u["name"],"mechanic":"cumulative","count":count,"threshold":threshold,"counter_key":key,"added":amount,"triggers":triggers})
+        atk=int(eff.get("attack",1) or 0); hp=int(eff.get("max_hp",1) or 0); bs=int(eff.get("bullet_strength",0) or 0)
+        for _ in range(triggers):
             if eff.get("type")=="team_buff":
-                apply_team_buff(u,idx,side,team,{"attack":atk_gain,"max_hp":hp_gain,"bullet_strength":bs_gain},events,source_effect="permanent")
+                apply_team_buff(u,idx,side,team,{"attack":atk,"max_hp":hp,"bullet_strength":bs},events,source_effect="permanent")
             else:
-                apply_unit_buff(u,atk_gain,hp_gain,bs_gain,unit_index=idx,side=side,events=events,source_effect="permanent",team=team)
-                events.append({"type":"permanent_buff","side":side,"slot":idx+1,"from":u["name"],"mechanic":"permanent","attack_gain":atk_gain,"max_hp_gain":hp_gain,"bullet_strength_gain":bs_gain,"attack":u["attack"],"max_hp":u["max_hp"],"current_hp":u["current_hp"],"bullet_strength":u.get("bullet_strength",0),"count":count,"threshold":threshold,"counter_key":key})
+                apply_unit_buff(u,atk,hp,bs,unit_index=idx,side=side,events=events,source_effect="permanent",team=team)
+                events.append({"type":"permanent_buff","side":side,"slot":idx+1,"from":u["name"],"mechanic":"permanent","attack_gain":atk,"max_hp_gain":hp,"bullet_strength_gain":bs,"attack":u["attack"],"max_hp":u["max_hp"],"current_hp":u["current_hp"],"bullet_strength":u.get("bullet_strength",0),"count":count,"threshold":threshold,"counter_key":key})
+
+
+def record_damage_instance(side, team, events):
+    record_damage_instances(side,team,events,1)
 
 def trigger_injury_growth(unit, unit_index, side, team, events, actual_damage):
     effect=unit.get("injury_growth") or {}
@@ -418,12 +427,12 @@ def trigger_injury_growth(unit, unit_index, side, team, events, actual_damage):
     apply_unit_buff(unit,amount,amount,unit_index=unit_index,side=side,events=events,source_effect="permanent",team=team)
     events.append({"type":"permanent_buff","side":side,"slot":unit_index+1,"from":unit["name"],"to":unit["name"],"mechanic":"injury_growth","source_effect":"permanent","attack_gain":amount,"max_hp_gain":amount,"attack":unit.get("attack",0),"max_hp":unit.get("max_hp",1),"current_hp":unit.get("current_hp",0),"injury_growth_count":unit["injury_growth_count"]})
 
-def deal_bullet_damage(source, source_index, side, allies, foes, target_index, target, base, events, source_effect=None, pending_deaths=None):
+def deal_bullet_damage(source, source_index, side, allies, foes, target_index, target, base, events, source_effect=None, pending_deaths=None, record_cumulative=True):
     strength=bullet_strength(source); dmg=int(base)+strength
     target_side="right" if side=="left" else "left"
     if dmg>0 and consume_shield(target):
-        events.append({"type":"shield_block","side":target_side,"slot":target_index+1,"from":target["name"],"source":source.get("name",""),"source_side":side,"damage_blocked":dmg})
-        record_damage_instance(side,allies,events)
+        events.append({"type":"shield_block","projectile":"bullet","side":target_side,"slot":target_index+1,"from":target["name"],"source":source.get("name",""),"source_side":side,"source_slot":source_index+1,"damage_blocked":dmg})
+        if record_cumulative: record_damage_instance(side,allies,events)
         return False
     target["current_hp"]-=dmg
     trigger_injury_growth(target,target_index,target_side,foes,events,dmg)
@@ -433,7 +442,7 @@ def deal_bullet_damage(source, source_index, side, allies, foes, target_index, t
     event={"side":side,"from":source["name"],"from_slot":source_index+1,"to":target["name"],"to_slot":target_index+1,"target_side":target_side,"damage_type":"bullet","damage":dmg,"bullet_base_damage":int(base),"bullet_strength":strength,"counter_damage":0,"target_hp":max(0,target["current_hp"]),"attacker_hp":max(0,source.get("current_hp",source.get("max_hp",0))),"target_dead":dead,"attacker_dead":False,"venom_triggered":venom_triggered}
     if source_effect: event["source_effect"]=source_effect
     events.append(event)
-    if dmg>0:
+    if dmg>0 and record_cumulative:
         record_damage_instance(side,allies,events)
     if target.get("_venom_destroyed"):
         target["current_hp"]=0; dead=True; event["target_hp"]=0; event["target_dead"]=True
@@ -447,7 +456,7 @@ def deal_bullet_damage(source, source_index, side, allies, foes, target_index, t
 def deal_spell_damage(source, source_index, side, allies, foes, target_index, target, base, events, source_effect=None, pending_deaths=None):
     dmg=int(base); target_side="right" if side=="left" else "left"
     if dmg>0 and consume_shield(target):
-        events.append({"type":"shield_block","side":target_side,"slot":target_index+1,"from":target["name"],"source":source.get("name",""),"source_side":side,"damage_blocked":dmg})
+        events.append({"type":"shield_block","side":target_side,"slot":target_index+1,"from":target["name"],"source":source.get("name",""),"source_side":side,"source_slot":source_index+1,"damage_blocked":dmg})
         return False
     target["current_hp"]-=dmg
     trigger_injury_growth(target,target_index,target_side,foes,events,dmg)
@@ -537,11 +546,14 @@ def resolve_one_precombat_effect(phase, unit, idx, team, foes, side, events):
     effect=unit.get(phase) or {}
     pending_deaths=[]
     if effect.get("type")=="random_bullet_damage":
+        batch_start=len(events)
+        events.append({"type":"bullet_batch_start"})
         for _ in range(max(1,int(effect.get("hits",1) or 1))):
             if team[idx] is not unit or unit.get("current_hp",0)<=0: break
             pair=random_target(foes,include_dead=True)
             if not pair: break
-            deal_bullet_damage(unit,idx,side,team,foes,pair[0],pair[1],effect.get("damage",0),events,source_effect=phase,pending_deaths=pending_deaths)
+            deal_bullet_damage(unit,idx,side,team,foes,pair[0],pair[1],effect.get("damage",0),events,source_effect=phase,pending_deaths=pending_deaths,record_cumulative=False)
+        finish_bullet_batch(side,team,events,batch_start)
     elif effect.get("type")=="team_buff":
         apply_team_buff(unit,idx,side,team,effect,events,source_effect=phase)
     elif effect.get("type")=="gain_skill_card":
@@ -692,18 +704,18 @@ def summon_unit_from_legacy(source, source_index, side, team, summon_id, grant_r
         events.append({"type":"summon","side":side,"slot":slot+1,"from":source["name"],"from_slot":source_index+1,"unit":copy.deepcopy(unit),"consume_revive_slot":source_index+1})
     return slot,unit
 
-def deal_friendly_bullet_damage(source, source_index, side, allies, foes, target_index, target, base, events, pending_deaths):
+def deal_friendly_bullet_damage(source, source_index, side, allies, foes, target_index, target, base, events, pending_deaths, record_cumulative=True):
     # Friendly fire never receives the source's bullet strength. Bullet strength
     # is added only when a friendly unit damages an enemy unit.
     dmg=int(base)
     if dmg>0 and consume_shield(target):
-        events.append({"type":"shield_block","side":side,"slot":target_index+1,"from":target["name"],"source":source.get("name",""),"source_side":side,"damage_blocked":dmg})
-        record_damage_instance(side,allies,events)
+        events.append({"type":"shield_block","projectile":"bullet","side":side,"slot":target_index+1,"from":target["name"],"source":source.get("name",""),"source_side":side,"source_slot":source_index+1,"damage_blocked":dmg})
+        if record_cumulative: record_damage_instance(side,allies,events)
         return
     target["current_hp"]-=dmg; trigger_injury_growth(target,target_index,side,allies,events,dmg); dead=target["current_hp"]<=0
     event={"side":side,"from":source["name"],"from_slot":source_index+1,"to":target["name"],"to_slot":target_index+1,"target_side":side,"damage_type":"bullet","damage":dmg,"bullet_base_damage":int(base),"bullet_strength":0,"counter_damage":0,"target_hp":max(0,target["current_hp"]),"attacker_hp":max(0,source.get("current_hp",0)),"target_dead":dead,"attacker_dead":True,"source_effect":"legacy","friendly_fire":True}
     events.append(event)
-    if dmg>0:
+    if dmg>0 and record_cumulative:
         record_damage_instance(side,allies,events)
     if dead and allies[target_index] is target:
         queue_pending_death(pending_deaths,target,target_index,side,allies,foes)
@@ -727,26 +739,44 @@ def summon_and_gain_dominant(source, source_index, side, allies, events, count):
             events.append({"type":"summon","side":side,"slot":slot+1,"from":source["name"],"from_slot":source_index+1,"unit":copy.deepcopy(summoned)})
         events.append({"type":"gain_card","side":side,"from":source["name"],"from_slot":source_index+1,"card":copy.deepcopy(gained),"card_id":gained["id"],"card_name":gained["name"],"source_effect":"legacy"})
 
+def finish_bullet_batch(side, team, events, start):
+    hits=sum(1 for ev in events[start:] if
+             (ev.get("damage_type")=="bullet" and ev.get("damage",0)>0)
+             or (ev.get("type")=="shield_block" and ev.get("damage_blocked",0)>0))
+    events.append({"type":"bullet_batch_end"})
+    record_damage_instances(side,team,events,hits)
+
+
 def trigger_legacy_effect(unit, unit_index, side, allies, foes, events, legacy):
     legacy=legacy or {}
     pending_deaths=[]
     if legacy.get("type")=="all_units_bullet_damage":
+        cumulative_hits=0
+        events.append({"type":"w_barrage_start","side":side,"from":unit["name"],"from_slot":unit_index+1,"source_effect":"legacy"})
         for _ in range(max(1,int(legacy.get("hits",1) or 1))):
             ally_targets=[(ti,target) for ti,target in enumerate(allies) if target and target.get("current_hp",0)>0]
             if not ally_targets:
                 corpse=random_target(allies,include_dead=True)
                 ally_targets=[corpse] if corpse else []
             for ti,target in ally_targets:
-                deal_friendly_bullet_damage(unit,unit_index,side,allies,foes,ti,target,legacy.get("damage",0),events,pending_deaths)
+                base_damage=int(legacy.get("damage",0) or 0)
+                deal_friendly_bullet_damage(unit,unit_index,side,allies,foes,ti,target,base_damage,events,pending_deaths,record_cumulative=False)
+                if base_damage>0: cumulative_hits+=1
             foe_targets=[(ti,target) for ti,target in enumerate(foes) if target and target.get("current_hp",0)>0]
             if not foe_targets:
                 corpse=random_target(foes,include_dead=True)
                 foe_targets=[corpse] if corpse else []
             for ti,target in foe_targets:
-                deal_bullet_damage(unit,unit_index,side,allies,foes,ti,target,legacy.get("damage",0),events,source_effect="legacy",pending_deaths=pending_deaths)
+                base_damage=int(legacy.get("damage",0) or 0)
+                deal_bullet_damage(unit,unit_index,side,allies,foes,ti,target,base_damage,events,source_effect="legacy",pending_deaths=pending_deaths,record_cumulative=False)
+                if base_damage+bullet_strength(unit)>0: cumulative_hits+=1
+        events.append({"type":"w_barrage_end","side":side,"from":unit["name"],"from_slot":unit_index+1,"source_effect":"legacy","damage_instances":cumulative_hits})
+        record_damage_instances(side,allies,events,cumulative_hits)
     elif legacy.get("type")=="summon_and_gain_dominant_faction":
         summon_and_gain_dominant(unit,unit_index,side,allies,events,legacy.get("count",1))
     elif legacy.get("type")=="bullet_damage":
+        batch_start=len(events)
+        events.append({"type":"bullet_batch_start"})
         hits=int(legacy.get("hits",1)); base=int(legacy.get("damage",0))+int(unit.get("bullet_damage",0) or 0)
         for _ in range(hits):
             if legacy.get("target")=="killer":
@@ -755,7 +785,8 @@ def trigger_legacy_effect(unit, unit_index, side, allies, foes, events, legacy):
             else:
                 pair=random_target(foes,include_dead=True) if legacy.get("target")=="random" else nearest_target(foes,unit_index,include_dead=True)
             if not pair: break
-            deal_bullet_damage(unit,unit_index,side,allies,foes,pair[0],pair[1],base,events,source_effect="legacy",pending_deaths=pending_deaths)
+            deal_bullet_damage(unit,unit_index,side,allies,foes,pair[0],pair[1],base,events,source_effect="legacy",pending_deaths=pending_deaths,record_cumulative=False)
+        finish_bullet_batch(side,allies,events,batch_start)
     elif legacy.get("type")=="spell_damage":
         hits=int(legacy.get("hits",1)); base=int(legacy.get("damage",0))
         for _ in range(hits):
@@ -776,11 +807,14 @@ def trigger_legacy_effect(unit, unit_index, side, allies, foes, events, legacy):
             for _ in range(raid_hits):
                 if allies[summoned_index] is not summoned_unit or summoned_unit.get("current_hp",0)<=0: break
                 if not perform_attack_action(summoned_unit,summoned_index,side,allies,foes,events,source_effect="raid"): break
+        batch_start=len(events)
+        events.append({"type":"bullet_batch_start"})
         hits=int(legacy.get("hits",1)); base=int(legacy.get("damage",0))+int(unit.get("bullet_damage",0) or 0)
         for _ in range(hits):
             pair=random_target(foes,include_dead=True) if legacy.get("target")=="random" else nearest_target(foes,unit_index,include_dead=True)
             if not pair: break
-            deal_bullet_damage(unit,unit_index,side,allies,foes,pair[0],pair[1],base,events,source_effect="legacy",pending_deaths=pending_deaths)
+            deal_bullet_damage(unit,unit_index,side,allies,foes,pair[0],pair[1],base,events,source_effect="legacy",pending_deaths=pending_deaths,record_cumulative=False)
+        finish_bullet_batch(side,allies,events,batch_start)
     elif legacy.get("type")=="gain_four_seasons":
         count=max(1,int(legacy.get("count",1) or 1)); level=max(1,min(MAX_SHOP_LEVEL,int(unit.get("battle_shop_level",1) or 1)))
         card=card_by_id(f"four_seasons_{level}")
@@ -928,7 +962,7 @@ def deal_cleave_damage(source, source_index, side, allies, foes, target_index, t
     target_side="right" if side=="left" else "left"; dmg=max(0,int(damage or 0)); blocked=False
     if dmg>0 and consume_shield(target):
         blocked=True
-        events.append({"type":"shield_block","side":target_side,"slot":target_index+1,"from":target["name"],"source":source["name"],"source_side":side,"damage_blocked":dmg})
+        events.append({"type":"shield_block","side":target_side,"slot":target_index+1,"from":target["name"],"source":source["name"],"source_side":side,"source_slot":source_index+1,"damage_blocked":dmg})
         dealt=0
     else:
         dealt=dmg;target["current_hp"]-=dealt
@@ -967,9 +1001,9 @@ def perform_attack_action(attacker, idx, side, mine, foes, events, round_number=
         return False
     dmg=attacker["attack"]; counter=target["attack"]; active_hit_attempted=dmg>0
     if dmg>0 and consume_shield(target):
-        events.append({"type":"shield_block","side":target_side,"slot":ti+1,"from":target["name"],"source":attacker["name"],"source_side":side,"damage_blocked":dmg}); dmg=0
+        events.append({"type":"shield_block","side":target_side,"slot":ti+1,"from":target["name"],"source":attacker["name"],"source_side":side,"source_slot":idx+1,"damage_blocked":dmg}); dmg=0
     if counter>0 and consume_shield(attacker):
-        events.append({"type":"shield_block","side":side,"slot":idx+1,"from":attacker["name"],"source":target["name"],"source_side":target_side,"damage_blocked":counter}); counter=0
+        events.append({"type":"shield_block","side":side,"slot":idx+1,"from":attacker["name"],"source":target["name"],"source_side":target_side,"source_slot":ti+1,"damage_blocked":counter}); counter=0
     target["current_hp"]-=dmg; attacker["current_hp"]-=counter
     trigger_injury_growth(target,ti,target_side,foes,events,dmg);trigger_injury_growth(attacker,idx,side,mine,events,counter)
     target_venom=apply_venom_after_damage(attacker,target,dmg); attacker_venom=apply_venom_after_damage(target,attacker,counter)
@@ -983,10 +1017,12 @@ def perform_attack_action(attacker, idx, side, mine, foes, events, round_number=
     if counter>0: record_damage_instance(target_side,foes,events)
     cleave_deaths=[]
     if attacker.get("cleave") or "cleave" in attacker.get("mechanics",[]):
-        for ci in (ti-1,ti+1):
-            adjacent=foes[ci] if 0<=ci<len(foes) else None
-            if adjacent and adjacent.get("current_hp",0)>0:
-                deal_cleave_damage(attacker,idx,side,mine,foes,ci,adjacent,attacker.get("attack",0),events,cleave_deaths)
+        # 阵亡单位留下的内部槽位不再隔断横斩：寻找目标两侧最近的存活棋子。
+        left_index=next((ci for ci in range(ti-1,-1,-1) if foes[ci] and foes[ci].get("current_hp",0)>0),None)
+        right_index=next((ci for ci in range(ti+1,len(foes)) if foes[ci] and foes[ci].get("current_hp",0)>0),None)
+        for ci in (left_index,right_index):
+            if ci is not None:
+                deal_cleave_damage(attacker,idx,side,mine,foes,ci,foes[ci],attacker.get("attack",0),events,cleave_deaths)
     resolve_pending_deaths(cleave_deaths,events)
     if target.get("_venom_destroyed"): target["current_hp"]=0
     if attacker.get("_venom_destroyed"): attacker["current_hp"]=0
@@ -1107,6 +1143,9 @@ class Handler(SimpleHTTPRequestHandler):
                 rn=int(data.get("round",1)); current=player(self.player_id()); result=tavern_battle(data.get("left",[]),data.get("right",[]),rn,current["shop_level"]); result.update(settle_battle(result,rn,self.player_id())); return self.json(result)
             return self.json({"error":"not found"},404)
         except (KeyError,ValueError) as e: return self.json({"error":str(e)},400)
+        except Exception:
+            logging.exception("POST %s failed",path)
+            return self.json({"error":"服务器处理请求失败，请查看服务端错误日志。"},500)
 
 def local_play_urls(port=PORT):
     urls=[f"http://127.0.0.1:{port}"]
